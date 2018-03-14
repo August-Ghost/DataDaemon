@@ -1,12 +1,10 @@
 # -*- coding: utf-8 -*-
 from asyncio import get_event_loop
-from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor
 import logging
-from platform import system
 import socket
 from os.path import join
 from os import getcwd
-import alertover.async as aao
 from sys import modules
 
 
@@ -41,10 +39,7 @@ class Glob:
         self.ACCESSLOGGER = self.ROOTLOGGER.getChild("AccessLog")
         self.ALERTOVER_NOTIFIER = None
         self.THREADPOOLEXEC = ThreadPoolExecutor()
-        if system() == "Windows":
-            self.PROCESSPOOLEXEC = self.THREADPOOLEXEC
-        else:
-            self.PROCESSPOOLEXEC = ProcessPoolExecutor()
+
 
     def __setattr__(self, key, value):
         object.__setattr__(self, key, value)

@@ -2,7 +2,7 @@
 from .shepherd import Shepherd
 import signal
 from .utilities import glob
-from sys import exit
+from sys import exit, platform
 import asyncio
 
 
@@ -10,8 +10,9 @@ class Mainframe:
     def __init__(self, **kargs):
         self.shepherd = Shepherd(**kargs)
         self.signal_mapping = {signal.SIGINT: signal.signal(signal.SIGINT, self.terminate),
-                               signal.SIGTERM: signal.signal(signal.SIGTERM, self.terminate),
-                               signal.SIGBREAK: signal.signal(signal.SIGBREAK, self.terminate)}
+                               signal.SIGTERM: signal.signal(signal.SIGTERM, self.terminate),}
+        if platform == "win32":
+            self.signal_mapping[signal.SIGBREAK] = signal.signal(signal.SIGBREAK, self.terminate)
         self.termination_in_progress = False
 
     def launch(self):

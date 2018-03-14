@@ -3,101 +3,96 @@ from datadaemon.base import CCXTGrabber
 from os import path
 import pandas as pd
 from datetime import datetime
-import sqlite3
 from sqlalchemy import create_engine
 from collections import defaultdict
-import pickle
-from datadaemon.utilities import glob
+from datadaemon.utilities.glob import CONFIG
 
 
 class rCCXTGrabber(CCXTGrabber):
     def __init__(self):
         self.db_conn = None
-        self.erase_buffer = defaultdict(lambda: True)
-        self.cols = ["timestamp_ms", "bar_time", "open", "close", "high", "low", "vol"]
-
+        self.cols = ["timestamp_ms", "bar_time", "open", "high", "low", "close", "vol"]
         super(rCCXTGrabber, self).__init__()
+        self.tradepair_last_update = defaultdict(str)
+        self.status_file = path.join(self.dumploc, "{name}_status.db".format(name=self.__class__.__name__))
+        self.dtype = {"timestamp_ms": "int64",
+                 "open": "float64",
+                 "high": "float64",
+                 "low": "float64",
+                 "close": "float64",
+                 "vol": "float64"}
 
     @property
     def status(self):
-        if (not self._status):
-            if path.exists(self.status_file) and not path.exists(self.status_file + ".temp"):
-                try:
-                    with open(self.status_file, "rb") as status_f:
-                        self._status = pickle.load(status_f)
-                except Exception as e:
-                    self.recover()
-            elif path.exists(self.status_file + ".temp"):
-                self.recover()
+        if (not self._status) and path.exists(self.status_file):
+            conn = create_engine("sqlite:///" + self.status_file)
+            df = pd.read_sql_table("save", conn, columns=["tradepair", "latest_ts"])
+            self._status = defaultdict(int, **dict(zip(df["tradepair"],
+                                                       df["latest_ts"])))
         return self._status
 
-    def dump_to_buffer(self, pair, data):
-        df = pd.DataFrame.from_records(data, columns=self.cols)
-        conn = create_engine("sqlite:///" + self.local_buffer)
-        df.to_sql(self.get_archive_table(pair),
-                  conn, index=False,
-                  if_exists="append" if not self.erase_buffer[pair] else "replace")
-        self.erase_buffer[pair] = False
+    async def save_status(self, trade_pair=None, ts=0, dump=False):
+        if trade_pair:
+            self.status[trade_pair] = ts
+            self.tradepair_last_update[trade_pair] = datetime.now(tz=CONFIG.timezone).strftime(
+                "%Y-%m-%d %H:%M:%S")
+        if dump:
+            conn = create_engine("sqlite:///" + self.status_file)
 
-    def on_tradepair_done(self, pair):
-        # Deliver data to remote database.
-        if path.exists(self.local_buffer) and self.db_conn:
-            archive_table = self.get_archive_table(pair)
-            src_conn = create_engine("sqlite:///" + self.local_buffer)
-            df = pd.pandas.read_sql_table(archive_table, src_conn)
+            df = pd.DataFrame.from_records(({"tradepair": i[0],
+                                            "latest_ts": i[1],
+                                             "latest_bartime": datetime.fromtimestamp(i[1] // 1000,
+                                                                                      tz=CONFIG.timezone).strftime(
+                                                 "%Y-%m-%d %H:%M:%S"),
+                                             "last_update": self.tradepair_last_update[i[0]]} for i in self.status.items()),
+                                           columns=["tradepair", "latest_ts", "latest_bartime", "last_update"],
+                                           )
+            df.to_sql("save", conn, index=False, if_exists="replace")
+
+    def save(self, pair, data):
+        df = self.fill(pd.DataFrame.from_records(data, columns=self.cols))
+        archive_table = self.get_archive_table(pair)
+        if self.db_conn:
             dst_conn = create_engine(self.db_conn)
-            df.to_sql(archive_table, dst_conn,
-                      index=False, if_exists="append")
-            self.erase_buffer[pair] = True
+        else:
+            dst_conn = create_engine("sqlite:///" + self.local_buffer)
+        df.to_sql(archive_table, dst_conn,
+                  index=False, if_exists="append")
+
+    def parseData(self, pair, data):
+        if data:
+            parsed_data = ({"timestamp_ms": i[0],
+                            "bar_time": datetime.fromtimestamp(i[0] // 1000,
+                                                               tz=CONFIG.timezone).strftime(
+                                "%Y-%m-%d %H:%M:%S"),
+                            "open": i[1],
+                            "high": i[2],
+                            "low": i[3],
+                            "close": i[4],
+                            "vol": i[5]} for i in data)
+            self.save(pair, parsed_data)
+
+    @property
+    def local_buffer(self):
+        return path.join(self.dumploc, "{0}.db".format(self.__class__.__name__))
+
+    def fill(self, df):
+        if (not df.empty)\
+                and len(df) < (int(df["timestamp_ms"].iloc[-1]) - int(df["timestamp_ms"].iloc[0])) // 60000 + 1:
+            result = pd.DataFrame()
+            result["timestamp_ms"] = range(int(df["timestamp_ms"].iloc[0]), int(df["timestamp_ms"].iloc[-1]) + 1, 60000)
+            result["bar_time"] = result["timestamp_ms"].apply(
+                lambda row: datetime.fromtimestamp(row // 1000, tz=CONFIG.timezone).strftime("%Y-%m-%d %H:%M:%S"))
+            result = result.merge(df.drop("bar_time", axis=1), on="timestamp_ms", how="outer")
+            result["vol"].fillna(0, inplace=True)
+            result["close"].fillna(method="ffill", inplace=True)
+            result = result.T
+            result.fillna(method="bfill", inplace=True)
+            return result.T.astype(self.dtype)
+        return df
 
     def get_archive_table(self, pair):
         base_currency, quote_currency = pair.split("/")
         archive_table = "{b}-{q}".format(b=base_currency,
                                          q=quote_currency)
         return archive_table
-
-    def on_task_done(self):
-        if path.exists(self.local_buffer) and self.db_conn:
-            conn = create_engine("sqlite:///" + self.local_buffer)
-            pd.io.sql.execute('VACUUM', conn)
-
-    @property
-    def local_buffer(self):
-        return path.join(self.dumploc, "{0}.db".format(self.__class__.__name__))
-
-    def recover(self):
-        # Try to recover data status from local buffer
-        if path.exists(self.local_buffer):
-            for pair in self.buffered_tradepairs:
-                sql = """
-                SELECT timestamp_ms + 1 AS latest
-                FROM "{0}"
-                WHERE  timestamp_ms == (
-                    SELECT max("timestamp_ms")
-                    FROM "{0}")
-                """.format(self.get_archive_table(pair))
-
-                conn = create_engine("sqlite:///" + self.local_buffer)
-                df = pd.read_sql_query(sql, conn)
-                if not df["latest"].empty:
-                    self._status[pair] = df["latest"].iloc[0]
-                else:
-                    self._status[pair] = 0
-            msg = "{0} recovered tradepair status from local buffer. "
-            glob.SYSLOGGER.info(msg.format(self.__class__.__name__))
-        else:
-            msg = "Local buffer absent. Unable to recover tradepair status for {0}."
-            raise RuntimeError(msg.format(self.__class__.__name__))
-
-    @property
-    def buffered_tradepairs(self):
-        if path.exists(self.local_buffer):
-            sql = """
-                    SELECT "tbl_name"
-                    FROM "sqlite_master"
-                    """
-            conn = create_engine("sqlite:///" + self.local_buffer)
-            df = pd.read_sql_query(sql, conn)
-            if not df["tbl_name"].empty:
-                return [pair.replace("-", "/") for pair in df["tbl_name"]]
-        return []

@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 from .basegrabber import BaseGrabber
-from os import path, makedirs, replace
+from os import path, replace
 from sys import exc_info
 import pickle
-from asyncio import CancelledError, sleep, ensure_future
+import aiohttp
+from asyncio import CancelledError, sleep
 from ..utilities import Finished, RetryLatest, Break, Abandon, Terminate
-from ..utilities import glob, dump_exception, exec_brief_info
+from ..utilities import glob, exec_brief_info
 from ccxt import BaseError as CcxtBaseError
 from aiohttp.client_exceptions import ClientError
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
+from random import random
 
 
 class CCXTGrabber(BaseGrabber):
@@ -52,7 +53,7 @@ class CCXTGrabber(BaseGrabber):
             try:
                 await self.deal_with_current_tradepair(pair)
             except Finished:
-                await self.loop.run_in_executor(glob.PROCESSPOOLEXEC,
+                await self.loop.run_in_executor(glob.THREADPOOLEXEC,
                                                              self.on_tradepair_done, pair)
             except Abandon:
                 break
@@ -65,7 +66,7 @@ class CCXTGrabber(BaseGrabber):
                 queue.append(pair)
         else:
             if not self.quit:
-                await self.loop.run_in_executor(glob.PROCESSPOOLEXEC,
+                await self.loop.run_in_executor(glob.THREADPOOLEXEC,
                                                 self.on_task_done)
             else:
                 raise CancelledError
@@ -76,9 +77,9 @@ class CCXTGrabber(BaseGrabber):
         while trails < max_retry and not self.quit:
             try:
                 await self.exchange.load_markets()
-            except CcxtBaseError as e:
-                err = e
-                if auto_retry:
+            except Exception as e:
+                if auto_retry and isinstance(e, (CcxtBaseError,  TypeError, aiohttp.client_exceptions.ClientError)):
+                    err = e
                     await self.sleep(5 << trails)
                     trails += 1
                 else:
@@ -103,7 +104,8 @@ class CCXTGrabber(BaseGrabber):
                         await self.sleep(5 << trials)
                         trials += 1
                     else:
-                        validated.append(pair)
+                        if data:
+                            validated.append(pair)
                         break
                 else:
                     glob.SYSLOGGER.warn("Invalid tradepair: {0} -> {1}.".format(self.__class__.__name__, pair))
@@ -168,28 +170,27 @@ class CCXTGrabber(BaseGrabber):
                         msg = "{0} -> {1} -> {2} -> parseData()"
                         glob.ERRLOGGER.exception(msg.format(self.__class__.__name__, pair, self.status[pair]))
                     else:
-                        self.save_status(pair, next_chunk)
+                        await self.save_status(pair, next_chunk, dump=True)
                 else:
                     msg = "{0} -> {1} finished. Next turn will start at {2}."
                     glob.SYSLOGGER.info(msg.format(self.__class__.__name__, pair, self.status[pair]))
                     raise Finished
                 turns += 1
 
-    def save_status(self, trade_pair=None, ts=0):
+    async def save_status(self, trade_pair=None, ts=0, dump=False):
         if trade_pair:
             self.status[trade_pair] = ts
-        with open(self.status_file + ".temp", "wb") as status_f:
-            pickle.dump(self.status, status_f)
-        replace(self.status_file + ".temp", self.status_file)
+        if dump:
+            with open(self.status_file + ".temp", "wb") as status_f:
+                pickle.dump(self.status, status_f)
+            replace(self.status_file + ".temp", self.status_file)
+            await sleep(random() / 100)
 
     async def on_task_start(self):
         if not self.tradepairs:
             await self.load_markets()
             self.tradepairs = self.exchange.symbols
         self._validated_tradpairs = await self.get_validated_tradepairs()
-
-    async def on_grabber_quit(self):
-        self.save_status()
 
     async def handle_exception(self, e, pair, current_chunk_id):
         if isinstance(e, (CcxtBaseError, ClientError, KeyError)):

@@ -1,19 +1,14 @@
 # -*- coding: utf-8 -*-
-from os import path, makedirs, replace
-from sys import exc_info
-import pickle
+from os import path, makedirs
 from asyncio import CancelledError, sleep, ensure_future
-from ..utilities import Finished, RetryLatest, Break, Abandon, Terminate
-from ..utilities import glob, dump_exception, exec_brief_info
-from ccxt import BaseError as CcxtBaseError
-from aiohttp.client_exceptions import ClientError
-from collections import defaultdict, deque
+from ..utilities import glob, dump_exception
 from datetime import datetime, timedelta
 
 
 class BaseGrabber:
 
     def __init__(self, loop=None):
+
         self.loop = loop if loop else glob.CURRENT_EVENTLOOP
         self.ratelimit = 0
         self.max_retry = 7
